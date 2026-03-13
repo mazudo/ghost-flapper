@@ -1,0 +1,1131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ghost Flapper</title>
+<style>
+  /* Reset all default browser spacing and ensure full-screen layout */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0010;          /* Deep purple-black page background */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;             /* Prevent scrollbars when canvas is centered */
+    font-family: monospace;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;   /* Keep crisp edges when scaled up on small screens */
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+// ─── Canvas Setup ───────────────────────────────────────────────────────────
+// All game logic uses a fixed virtual resolution (BASE_W × BASE_H).
+// The canvas is scaled to fit the window while preserving aspect ratio.
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const BASE_W = 480;   // Virtual game width  (pixels)
+const BASE_H = 640;   // Virtual game height (pixels)
+
+/**
+ * Resize the canvas to fill the window while maintaining the 480×640 aspect ratio.
+ * Called once on load and again whenever the window is resized.
+ */
+function resize() {
+  const scale = Math.min(window.innerWidth / BASE_W, window.innerHeight / BASE_H);
+  canvas.width  = Math.floor(BASE_W * scale);
+  canvas.height = Math.floor(BASE_H * scale);
+  canvas.style.width  = canvas.width  + 'px';
+  canvas.style.height = canvas.height + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+/**
+ * Returns the current pixel-per-virtual-pixel scale factor.
+ * Used in the game loop to apply a uniform ctx.scale() transform so that
+ * all draw calls can use BASE_W/BASE_H coordinates regardless of window size.
+ */
+function getScale() { return canvas.width / BASE_W; }
+
+// ─── Difficulty Config ───────────────────────────────────────────────────────
+// Central table for every tunable difficulty value.
+// rampDifficulty() reads from here to know the caps and step sizes.
+const DIFFICULTY = {
+  pipeSpeed:           2.5,  // Starting scroll speed (px per frame)
+  pipeSpeedMax:        6,    // Speed is capped here to stay playable
+  pipeSpeedIncrease:   0.15, // Speed added per ramp event
+  pipeGap:             180,  // Starting vertical gap between pipe pair (px)
+  pipeGapMin:          110,  // Gap floors here so the game stays possible
+  pipeGapDecrease:     4,    // Gap shrinks by this many px per ramp event
+  pipeInterval:        90,   // Frames between pipe spawns (at 60 fps ≈ 1.5 s)
+  pipeIntervalMin:     55,   // Fastest spawn rate allowed (~0.9 s)
+  increaseEveryNPipes: 5,    // How many pipes cleared before each ramp event
+};
+
+// ─── Game State Machine ───────────────────────────────────────────────────────
+// The game progresses through these states in order:
+//   START → PLAYING → DEAD → NAME_ENTRY (if high score) → GAME_OVER → START …
+const STATE = {
+  START:      'START',       // Title screen; ghost bobs idly
+  PLAYING:    'PLAYING',     // Active gameplay loop
+  DEAD:       'DEAD',        // Brief death animation + red flash before transitioning
+  NAME_ENTRY: 'NAME_ENTRY',  // Retro 3-char name input (only if score qualifies)
+  GAME_OVER:  'GAME_OVER',   // Final score + high score table; wait for restart
+};
+let gameState = STATE.START;
+
+// ─── High Score Persistence ───────────────────────────────────────────────────
+// Scores are stored in localStorage as a JSON array of { name, score } objects,
+// sorted descending, capped at 5 entries.
+
+/** Load the high score array from localStorage (returns [] on parse error). */
+function loadScores() {
+  try { return JSON.parse(localStorage.getItem('ghostFlapper_scores') || '[]'); }
+  catch { return []; }
+}
+
+/** Persist the score array back to localStorage. */
+function saveScores(scores) {
+  localStorage.setItem('ghostFlapper_scores', JSON.stringify(scores));
+}
+
+/**
+ * Returns true if `score` would appear in the top-5 list.
+ * A score of 0 never qualifies (avoids name entry on instant death).
+ */
+function qualifiesForHighScore(score) {
+  const scores = loadScores();
+  return score > 0 && (scores.length < 5 || score > scores[scores.length - 1].score);
+}
+
+/**
+ * Insert a new { name, score } entry, re-sort descending, trim to 5, and save.
+ */
+function insertScore(name, score) {
+  const scores = loadScores();
+  scores.push({ name, score });
+  scores.sort((a, b) => b.score - a.score);
+  scores.splice(5);   // Keep only top 5
+  saveScores(scores);
+}
+
+// ─── Stars ───────────────────────────────────────────────────────────────────
+// Stars are generated once and reused every frame.
+// Each star has an independent twinkle phase and rate so they don't pulse in sync.
+const NUM_STARS = 80;
+const stars = Array.from({ length: NUM_STARS }, () => ({
+  x:       Math.random() * BASE_W,
+  y:       Math.random() * BASE_H * 0.75,  // Only in the upper 75% (sky area)
+  r:       Math.random() * 1.5 + 0.3,      // Radius 0.3–1.8 px
+  twinkle: Math.random() * Math.PI * 2,    // Random starting phase
+  speed:   Math.random() * 0.2 + 0.05,     // Twinkle rate (radians per frame)
+}));
+
+// ─── Ghost Constants ──────────────────────────────────────────────────────────
+const GROUND_H = 60;   // Height of the ground strip at the bottom
+const GHOST_X  = 100;  // Fixed horizontal position of the ghost (px)
+const GHOST_W  = 38;   // Bounding-box width used for hitbox and drawing
+const GHOST_H  = 46;   // Bounding-box height
+
+// ─── Ghost Class ─────────────────────────────────────────────────────────────
+/**
+ * The player character.  Physics are simple: constant downward gravity + an
+ * upward velocity impulse (flap).  On death the ghost tumbles off-screen.
+ */
+class Ghost {
+  constructor() { this.reset(); }
+
+  /** Restore all physics and animation state to starting values. */
+  reset() {
+    this.y        = BASE_H / 2;  // Vertical centre position (px from top)
+    this.vy       = 0;           // Vertical velocity (positive = downward)
+    this.gravity  = 0.38;        // Downward acceleration per frame
+    this.flapPower = -7.2;       // Upward velocity applied on flap (negative = up)
+
+    // Squish/stretch spring: squish < 1 compresses the ghost vertically on flap,
+    // then springs back to 1 driven by squishV.
+    this.squish  = 1;
+    this.squishV = 0;
+
+    this.wobbleT = 0;   // Accumulated time for wavy-tail animation
+
+    // Death tumble state (only used when this.dead === true)
+    this.dead     = false;
+    this.deathVx  = 0;
+    this.deathVy  = 0;
+    this.deathX   = GHOST_X;
+    this.deathY   = BASE_H / 2;
+    this.rotation = 0;   // Tumble angle in radians
+  }
+
+  /** Apply an upward velocity impulse and trigger the squish animation. */
+  flap() {
+    if (this.dead) return;
+    this.vy      = this.flapPower;
+    this.squish  = 0.6;   // Instantly compress to 60% height
+    this.squishV = 0.07;  // Spring rate that pushes squish back toward 1
+  }
+
+  /** Advance physics by one frame. */
+  update() {
+    if (this.dead) {
+      // After death: apply gravity to the tumble and spin the ghost
+      this.deathVy += 0.5;
+      this.deathX  += this.deathVx;
+      this.deathY  += this.deathVy;
+      this.rotation += 0.1;   // Constant spin speed (radians/frame)
+      return;
+    }
+
+    // Normal physics
+    this.vy += this.gravity;
+    this.y  += this.vy;
+    this.wobbleT += 0.12;   // Advance tail wobble clock
+
+    // Simple spring: squish accelerates back toward 1.0
+    this.squish += this.squishV;
+    if (this.squish > 1) {
+      // Clamp and stop spring once fully restored
+      this.squish  = 1;
+      this.squishV = 0;
+    } else if (this.squish < 1) {
+      // Accelerate the return toward 1
+      this.squishV += 0.01;
+    }
+  }
+
+  /** Trigger death: freeze position and set tumble velocity. */
+  die() {
+    this.dead    = true;
+    this.deathX  = GHOST_X;
+    this.deathY  = this.y;
+    this.deathVx = -1.5;              // Drift slightly left
+    this.deathVy = this.vy * 0.5 - 2; // Inherit some upward momentum
+    this.rotation = 0;
+  }
+
+  /**
+   * Returns a shrunken AABB (axis-aligned bounding box) for collision testing.
+   * The 8 px margin on all sides gives the player a small forgiveness window
+   * so near-misses don't feel unfair.
+   */
+  getHitbox() {
+    const margin = 8;
+    return {
+      x: GHOST_X   - GHOST_W / 2 + margin,
+      y: this.y    - GHOST_H / 2 + margin,
+      w: GHOST_W   - margin * 2,
+      h: GHOST_H   - margin * 2,
+    };
+  }
+
+  /** Render the ghost at its current position using procedural canvas drawing. */
+  draw() {
+    // When alive use fixed GHOST_X; when dead use tumble position
+    const cx = this.dead ? this.deathX : GHOST_X;
+    const cy = this.dead ? this.deathY : this.y;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    if (this.dead) ctx.rotate(this.rotation);   // Tumble spin
+    ctx.scale(1, this.squish);                  // Vertical squish/stretch
+
+    const t = this.wobbleT;   // Shorthand for the wobble clock
+    const W = GHOST_W;
+    const H = GHOST_H;
+
+    // ── Drop shadow (flattened ellipse below the body) ──
+    ctx.save();
+    ctx.scale(1, 0.2);
+    ctx.translate(0, H / 2 + 5);
+    const shadowGrd = ctx.createRadialGradient(0, 0, 0, 0, 0, W * 0.5);
+    shadowGrd.addColorStop(0, 'rgba(0,0,0,0.35)');
+    shadowGrd.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = shadowGrd;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, W * 0.5, W * 0.3, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // ── Soft ambient glow around the ghost body ──
+    const glowGrd = ctx.createRadialGradient(0, -H * 0.1, 0, 0, -H * 0.1, W * 0.8);
+    glowGrd.addColorStop(0, 'rgba(200,200,255,0.25)');
+    glowGrd.addColorStop(1, 'rgba(100,100,200,0)');
+    ctx.fillStyle = glowGrd;
+    ctx.beginPath();
+    ctx.ellipse(0, -H * 0.1, W * 0.8, W * 0.8, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // ── Ghost body shape ──
+    // The body is built as a single path: a bezier dome on top plus a wavy
+    // bottom edge.  The wave is driven by sin(wobbleT) to animate the tail.
+    ctx.beginPath();
+    const bx = -W / 2, by = -H / 2;
+    const bw = W,       bh = H;
+
+    // Top dome (bezier curve from left shoulder to right shoulder)
+    ctx.moveTo(bx, by + bh * 0.45);
+    ctx.bezierCurveTo(bx, by - bh * 0.1, bx + bw, by - bh * 0.1, bx + bw, by + bh * 0.45);
+
+    // Wavy bottom: 5 points across the width alternate up/down, jiggled by sin
+    const waveAmp = 5;
+    const steps   = 4;
+    const stepW   = bw / steps;
+    for (let i = steps; i >= 0; i--) {
+      const wx = bx + i * stepW;
+      const wy = by + bh * 0.45
+               + (i % 2 === 0 ? waveAmp : -waveAmp)   // Alternating up/down
+               + Math.sin(t + i * 1.2) * 3;            // Animated jiggle
+      ctx.lineTo(wx, wy);
+    }
+    ctx.closePath();
+
+    // Vertical gradient fill (light top, slightly blue-tinted bottom)
+    const bodyGrd = ctx.createLinearGradient(0, by, 0, by + bh);
+    bodyGrd.addColorStop(0,   '#e8e8ff');
+    bodyGrd.addColorStop(0.5, '#d0d0f8');
+    bodyGrd.addColorStop(1,   '#b0b0e8');
+    ctx.fillStyle = bodyGrd;
+    ctx.fill();
+
+    // Soft outline
+    ctx.strokeStyle = 'rgba(160,160,220,0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // ── Eyes ──
+    const eyeY   = by + bh * 0.22;   // Vertical position of eye centres
+    const eyeOffX = W * 0.18;        // Horizontal distance from centre to each eye
+
+    ctx.fillStyle = '#1a0a2e';
+    ctx.beginPath();
+    ctx.ellipse(-eyeOffX, eyeY, 5, 5.5, 0, 0, Math.PI * 2);   // Left
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse( eyeOffX, eyeY, 5, 5.5, 0, 0, Math.PI * 2);   // Right
+    ctx.fill();
+
+    // Small white highlight dot on each eye
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.beginPath();
+    ctx.ellipse(-eyeOffX + 1.5, eyeY - 1.5, 2, 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse( eyeOffX + 1.5, eyeY - 1.5, 2, 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // ── Smile ──
+    ctx.strokeStyle = 'rgba(80,60,120,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, eyeY + 7, 5, 0.1, Math.PI - 0.1);   // Bottom half of arc = smile
+    ctx.stroke();
+
+    // ── Rosy cheeks (subtle translucent blush) ──
+    ctx.fillStyle = 'rgba(255,150,150,0.25)';
+    ctx.beginPath();
+    ctx.ellipse(-eyeOffX - 2, eyeY + 4, 5, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse( eyeOffX + 2, eyeY + 4, 5, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+}
+
+// ─── Pipe Class ───────────────────────────────────────────────────────────────
+/**
+ * A pipe pair: one stone pillar from the top, one from the bottom.
+ * The gap between them is what the ghost must fly through.
+ * Each pipe also carries an animated bat that perches on the top pillar.
+ */
+class Pipe {
+  /**
+   * @param {number} x      - Initial left edge (usually just off the right side of screen)
+   * @param {number} gapY   - Vertical centre of the gap (px from top)
+   * @param {number} gapH   - Total height of the gap the ghost must pass through
+   * @param {number} speed  - Scroll speed (px per frame)
+   */
+  constructor(x, gapY, gapH, speed) {
+    this.x      = x;
+    this.gapY   = gapY;    // Centre of the passable gap
+    this.gapH   = gapH;    // Height of the passable gap
+    this.speed  = speed;
+    this.w      = 52;      // Pillar width (px)
+    this.passed = false;   // Set to true once the ghost clears this pipe (for scoring)
+    this.batT   = Math.random() * Math.PI * 2;  // Random bat animation phase
+  }
+
+  /** Scroll left and advance the bat animation clock. */
+  update() {
+    this.x   -= this.speed;
+    this.batT += 0.05;
+  }
+
+  /** True once the pipe has scrolled entirely off the left edge. */
+  isOffScreen() { return this.x + this.w < 0; }
+
+  /** AABB for the top pillar (from y=0 down to the top of the gap). */
+  getTopRect()    { return { x: this.x, y: 0,                        w: this.w, h: this.gapY - this.gapH / 2 }; }
+  /** AABB for the bottom pillar (from the bottom of the gap to the ground). */
+  getBottomRect() { return { x: this.x, y: this.gapY + this.gapH / 2, w: this.w, h: BASE_H }; }
+
+  /**
+   * Draw a single stone castle pillar.
+   * @param {boolean} isTop - Controls which end gets the battlement cap and
+   *                          how horizontal brick joints are offset for variety.
+   */
+  drawPillar(x, y, w, h, isTop) {
+    // ── Base stone fill (horizontal gradient for a slight 3-D look) ──
+    const stoneGrd = ctx.createLinearGradient(x, y, x + w, y);
+    stoneGrd.addColorStop(0,   '#3a2a4a');
+    stoneGrd.addColorStop(0.3, '#4a3a5a');
+    stoneGrd.addColorStop(0.7, '#3a2a4a');
+    stoneGrd.addColorStop(1,   '#2a1a3a');
+    ctx.fillStyle = stoneGrd;
+    ctx.fillRect(x, y, w, h);
+
+    // ── Horizontal mortar lines (stone block rows) ──
+    ctx.strokeStyle = 'rgba(20,10,30,0.6)';
+    ctx.lineWidth   = 1;
+    const blockH = 18;
+    // Top and bottom pillars offset row start so blocks don't align at the gap
+    for (let by = (isTop ? y : y + blockH / 2); by < y + h; by += blockH) {
+      ctx.beginPath();
+      ctx.moveTo(x,     by);
+      ctx.lineTo(x + w, by);
+      ctx.stroke();
+    }
+
+    // ── Vertical mortar joints (alternating every row for a running-bond look) ──
+    for (let by = (isTop ? y : y + blockH / 2), row = 0; by < y + h; by += blockH, row++) {
+      const offset = row % 2 === 0 ? w / 2 : w / 3;  // Stagger joint positions
+      ctx.beginPath();
+      ctx.moveTo(x + offset, by);
+      ctx.lineTo(x + offset, Math.min(by + blockH, y + h));
+      ctx.stroke();
+    }
+
+    // ── Left highlight / right shadow to suggest lit-from-left ──
+    ctx.fillStyle = 'rgba(100,80,140,0.3)';
+    ctx.fillRect(x,         y, 4, h);   // Left edge lighter
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(x + w - 4, y, 4, h);   // Right edge darker
+
+    // ── Battlement cap (wider than the pillar, facing the gap) ──
+    const capH = 14;
+    const capW = w + 8;
+    const capX = x - 4;
+    // Top pillar cap is at the bottom (faces down into the gap);
+    // Bottom pillar cap is at the top (faces up into the gap).
+    const capY = isTop ? y + h - capH : y;
+    ctx.fillStyle = '#3a2a4a';
+    ctx.fillRect(capX, capY, capW, capH);
+
+    // Battlement teeth (crenellations)
+    const battleW   = 12, battleH = 10, battleGap = 4;
+    ctx.fillStyle = '#2a1a3a';
+    if (isTop) {
+      // Teeth point downward from the top pillar's cap
+      for (let bx = capX + 4; bx < capX + capW - battleW; bx += battleW + battleGap) {
+        ctx.fillRect(bx, capY - battleH, battleW, battleH);
+      }
+    } else {
+      // Teeth point upward from the bottom pillar's cap
+      for (let bx = capX + 4; bx < capX + capW - battleW; bx += battleW + battleGap) {
+        ctx.fillRect(bx, capY + capH, battleW, battleH);
+      }
+    }
+
+    // ── Subtle moss/magic glow at the very top and bottom edges ──
+    ctx.fillStyle = 'rgba(60,200,80,0.12)';
+    ctx.fillRect(x, y,         w, 3);
+    ctx.fillRect(x, y + h - 3, w, 3);
+  }
+
+  /**
+   * Draw a small animated bat that hovers above the top pillar.
+   * Wings flap via sin(batT * 3) and the whole bat bobs vertically on sin(batT).
+   */
+  drawBat(cx, cy) {
+    const t = this.batT;
+    ctx.save();
+    ctx.translate(cx, cy + Math.sin(t) * 3);   // Vertical bob
+    ctx.fillStyle = '#1a0a2a';
+
+    // Bat body
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 4, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Wing flap angle oscillates between ±0.4 rad
+    const flapAngle = Math.sin(t * 3) * 0.4;
+
+    // Left wing (rotated counter-clockwise when flapping up)
+    ctx.save();
+    ctx.rotate(-flapAngle - 0.3);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(-8, -6, -14, -2, -12, 4);
+    ctx.bezierCurveTo(-8,  2,  -4,  4,   0, 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Right wing (mirrored rotation)
+    ctx.save();
+    ctx.rotate(flapAngle + 0.3);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(8, -6, 14, -2, 12, 4);
+    ctx.bezierCurveTo(8,  2,  4,  4,  0, 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Glowing red eyes
+    ctx.fillStyle = '#ff4040';
+    ctx.beginPath();
+    ctx.arc(-1.5, -1, 1, 0, Math.PI * 2);
+    ctx.arc( 1.5, -1, 1, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  /** Draw both pillars, the bat, and a faint purple glow in the gap. */
+  draw() {
+    const top = this.getTopRect();
+    const bot = this.getBottomRect();
+
+    // Only draw pillar if it has non-zero height (gap could reach screen top/bottom)
+    if (top.h > 0) {
+      this.drawPillar(top.x, top.y, top.w, top.h, true);
+      this.drawBat(this.x + this.w / 2, top.y + 10);   // Bat perches at the cap
+    }
+    if (bot.h > 0) {
+      this.drawPillar(bot.x, bot.y, bot.w, bot.h, false);
+    }
+
+    // Eerie radial glow in the gap to make the opening more visible
+    const gapGrd = ctx.createRadialGradient(
+      this.x + this.w / 2, this.gapY, 0,
+      this.x + this.w / 2, this.gapY, this.gapH * 0.7
+    );
+    gapGrd.addColorStop(0, 'rgba(150,50,255,0.08)');
+    gapGrd.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = gapGrd;
+    ctx.fillRect(this.x, this.gapY - this.gapH / 2, this.w, this.gapH);
+  }
+}
+
+// ─── Game Variables ──────────────────────────────────────────────────────────
+// Declared at module scope so initGame() can reset them between rounds.
+let ghost,           // Ghost instance (player)
+    pipes,           // Array of active Pipe instances
+    score,           // Current score (pipes cleared)
+    pipeTimer,       // Frames since the last pipe was spawned
+    currentGap,      // Current gap height (shrinks over time)
+    currentSpeed,    // Current pipe scroll speed (grows over time)
+    currentInterval, // Current frames between spawns (shrinks over time)
+    pipesCleared,    // Total pipes cleared this round (triggers difficulty ramp)
+    flashFrames,     // Countdown for the red death flash effect
+    frameCount;      // Total frames rendered since game init (used for blink timers)
+
+// Name entry state: 3-char name, which slot is selected, and the score being saved
+let nameChars   = ['A', 'A', 'A'];
+let nameCursor  = 0;      // Index of the currently-selected letter slot (0–2)
+let pendingScore = 0;     // Score waiting to be saved after name entry
+
+/**
+ * Reset all mutable game state to starting values.
+ * Called at the very beginning and each time the player restarts.
+ */
+function initGame() {
+  ghost           = new Ghost();
+  pipes           = [];
+  score           = 0;
+  pipeTimer       = 0;
+  currentGap      = DIFFICULTY.pipeGap;
+  currentSpeed    = DIFFICULTY.pipeSpeed;
+  currentInterval = DIFFICULTY.pipeInterval;
+  pipesCleared    = 0;
+  flashFrames     = 0;
+  frameCount      = 0;
+}
+
+// ─── Background & Environment ─────────────────────────────────────────────────
+// bgOffset scrolls the gravestone layer to create a subtle parallax effect.
+let bgOffset = 0;
+
+// Gravestones are generated once with random sizes and types.
+// They tile horizontally by wrapping bgOffset modulo (BASE_W + 60).
+let groundStones = Array.from({ length: 12 }, (_, i) => ({
+  x:    i * 45 + Math.random() * 20,          // Staggered starting positions
+  w:    30 + Math.random() * 20,
+  h:    15 + Math.random() * 20,
+  type: Math.floor(Math.random() * 3),         // 0 = rounded, 1 = pointed, 2 = cross
+}));
+
+/** Draw the sky, moon, stars, ground strip, and scrolling gravestones. */
+function drawBackground() {
+  // Sky: dark purple gradient from near-black at the top to slightly lighter at the horizon
+  const skyGrd = ctx.createLinearGradient(0, 0, 0, BASE_H - GROUND_H);
+  skyGrd.addColorStop(0,   '#04001a');
+  skyGrd.addColorStop(0.5, '#0d0028');
+  skyGrd.addColorStop(1,   '#1a0038');
+  ctx.fillStyle = skyGrd;
+  ctx.fillRect(0, 0, BASE_W, BASE_H - GROUND_H);
+
+  // Moon: outer radial glow + solid disc + craters
+  const moonX = BASE_W * 0.78, moonY = 80;
+  const moonGlow = ctx.createRadialGradient(moonX, moonY, 0, moonX, moonY, 90);
+  moonGlow.addColorStop(0,   'rgba(255,250,200,0.15)');
+  moonGlow.addColorStop(0.5, 'rgba(255,240,150,0.06)');
+  moonGlow.addColorStop(1,   'rgba(0,0,0,0)');
+  ctx.fillStyle = moonGlow;
+  ctx.beginPath();
+  ctx.arc(moonX, moonY, 90, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#fff8c8';   // Cream-yellow moon disc
+  ctx.beginPath();
+  ctx.arc(moonX, moonY, 38, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Slightly darker craters painted on top of the moon
+  ctx.fillStyle = 'rgba(200,190,120,0.4)';
+  ctx.beginPath(); ctx.arc(moonX - 12, moonY + 8,  7, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(moonX + 14, moonY - 10, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(moonX + 5,  moonY + 16, 4, 0, Math.PI * 2); ctx.fill();
+
+  // Stars: each twinkles at its own rate using sin(phase + frameCount * speed)
+  for (const s of stars) {
+    const brightness = 0.5 + 0.5 * Math.sin(s.twinkle + frameCount * s.speed);
+    ctx.fillStyle = `rgba(200,200,255,${brightness * 0.9})`;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Ground strip
+  const groundY = BASE_H - GROUND_H;
+  const groundGrd = ctx.createLinearGradient(0, groundY, 0, BASE_H);
+  groundGrd.addColorStop(0,   '#1a1028');
+  groundGrd.addColorStop(0.3, '#120820');
+  groundGrd.addColorStop(1,   '#0a0418');
+  ctx.fillStyle = groundGrd;
+  ctx.fillRect(0, groundY, BASE_W, GROUND_H);
+
+  // Ground edge: a narrow highlight stripe where sky meets ground
+  ctx.fillStyle = '#2a1840';
+  ctx.fillRect(0, groundY, BASE_W, 4);
+  ctx.fillStyle = 'rgba(150,100,200,0.2)';
+  ctx.fillRect(0, groundY, BASE_W, 2);
+
+  // Gravestones scroll at 30% of bgOffset for a shallow parallax layer
+  ctx.fillStyle = '#2a1a3a';
+  for (const s of groundStones) {
+    // Wrap the x position so stones tile seamlessly as bgOffset grows
+    const sx = ((s.x - bgOffset * 0.3) % (BASE_W + 60) + BASE_W + 60) % (BASE_W + 60) - 30;
+    drawGravestone(sx, groundY - s.h + 4, s.w, s.h, s.type);
+  }
+}
+
+/**
+ * Draw a single gravestone silhouette.
+ * @param {number} type - 0: rounded top  1: pointed top  2: cross shape
+ */
+function drawGravestone(x, y, w, h, type) {
+  ctx.save();
+  ctx.fillStyle = '#2d1e40';
+
+  if (type === 0) {
+    // Classic rounded-top headstone: dome on top, rectangle below
+    ctx.beginPath();
+    ctx.arc(x + w / 2, y + w / 2, w / 2, Math.PI, 0);
+    ctx.rect(x, y + w / 2, w, h - w / 2);
+    ctx.fill();
+  } else if (type === 1) {
+    // Gothic pointed-top headstone
+    ctx.beginPath();
+    ctx.moveTo(x + w / 2, y);
+    ctx.lineTo(x + w, y + h * 0.3);
+    ctx.lineTo(x + w, y + h);
+    ctx.lineTo(x,     y + h);
+    ctx.lineTo(x,     y + h * 0.3);
+    ctx.closePath();
+    ctx.fill();
+  } else {
+    // Cross headstone: vertical bar + horizontal bar
+    ctx.fillRect(x + w * 0.35,  y,            w * 0.3,  h);
+    ctx.fillRect(x,              y + h * 0.25, w,        h * 0.22);
+  }
+
+  // Soft ambient glow around each gravestone
+  ctx.fillStyle = 'rgba(100,60,160,0.15)';
+  ctx.beginPath();
+  ctx.arc(x + w / 2, y + h / 2, w * 0.7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+// ─── Collision Detection ──────────────────────────────────────────────────────
+
+/**
+ * Standard AABB overlap test.
+ * Returns true if rectangles `a` and `b` intersect.
+ */
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x
+      && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+/**
+ * Test the ghost's hitbox against the ceiling, ground, and every pipe.
+ * Returns true on any collision (triggers death).
+ */
+function checkCollisions() {
+  const hb = ghost.getHitbox();
+
+  // Ceiling (y < 0) or ground strip
+  if (hb.y + hb.h > BASE_H - GROUND_H || hb.y < 0) return true;
+
+  // Pipe pairs
+  for (const p of pipes) {
+    if (rectsOverlap(hb, p.getTopRect()) || rectsOverlap(hb, p.getBottomRect())) return true;
+  }
+  return false;
+}
+
+// ─── Pipe Spawning ────────────────────────────────────────────────────────────
+
+/**
+ * Create a new pipe pair just off the right edge of the screen.
+ * The gap centre is randomised within a safe vertical range so the ghost
+ * always has a reachable path.
+ */
+function spawnPipe() {
+  const margin = 80;  // Minimum distance from screen top/bottom to gap centre
+  const gapY   = margin + Math.random() * (BASE_H - GROUND_H - margin * 2 - currentGap);
+  const centerY = gapY + currentGap / 2;
+  pipes.push(new Pipe(BASE_W + 30, centerY, currentGap, currentSpeed));
+}
+
+// ─── Difficulty Ramp ──────────────────────────────────────────────────────────
+
+/**
+ * Called every `increaseEveryNPipes` pipes cleared.
+ * Increases speed, reduces gap, and shortens the spawn interval — each clamped
+ * to their respective minimum/maximum so the game stays playable.
+ */
+function rampDifficulty() {
+  currentSpeed    = Math.min(DIFFICULTY.pipeSpeedMax,    currentSpeed    + DIFFICULTY.pipeSpeedIncrease);
+  currentGap      = Math.max(DIFFICULTY.pipeGapMin,      currentGap      - DIFFICULTY.pipeGapDecrease);
+  currentInterval = Math.max(DIFFICULTY.pipeIntervalMin, currentInterval - 2);
+  // Apply the new speed to pipes already on screen so the transition is instant
+  for (const p of pipes) p.speed = currentSpeed;
+}
+
+// ─── Name Entry Screen ────────────────────────────────────────────────────────
+
+/**
+ * Render the retro 3-character name entry UI.
+ * The active slot is highlighted with a purple glow.
+ * Up/Down cycle the letter; Left/Right move between slots; Enter confirms.
+ */
+function drawNameEntry() {
+  // Dark overlay over the frozen game scene
+  ctx.fillStyle = 'rgba(10,0,20,0.88)';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+  drawSpookyBorder();
+
+  const cx = BASE_W / 2;
+  ctx.textAlign = 'center';
+
+  // Headline
+  ctx.fillStyle = '#cc44ff';
+  ctx.font = 'bold 13px monospace';
+  ctx.fillText('* NEW HIGH SCORE! *', cx, 120);
+
+  ctx.fillStyle = '#ff8844';
+  ctx.font = 'bold 11px monospace';
+  ctx.fillText(`SCORE: ${pendingScore}`, cx, 145);
+
+  // Instructions
+  ctx.fillStyle = '#e0d0ff';
+  ctx.font = '10px monospace';
+  ctx.fillText('ENTER YOUR NAME',                         cx, 185);
+  ctx.fillText('UP/DOWN: change letter   LEFT/RIGHT: move', cx, 200);
+  ctx.fillText('ENTER: confirm',                          cx, 215);
+
+  // Letter slots
+  const slotW = 44, slotH = 54, slotGap = 10;
+  const totalW = slotW * 3 + slotGap * 2;
+  const startX = cx - totalW / 2;
+  const slotY  = 240;
+
+  for (let i = 0; i < 3; i++) {
+    const sx       = startX + i * (slotW + slotGap);
+    const isActive = i === nameCursor;
+
+    // Slot background (brighter when active)
+    ctx.fillStyle = isActive ? 'rgba(150,50,255,0.3)' : 'rgba(40,20,70,0.6)';
+    ctx.fillRect(sx, slotY, slotW, slotH);
+
+    // Slot border
+    ctx.strokeStyle = isActive ? '#cc44ff' : '#6a3a9a';
+    ctx.lineWidth   = isActive ? 2.5 : 1.5;
+    ctx.strokeRect(sx, slotY, slotW, slotH);
+
+    if (isActive) {
+      // Extra glow stroke on the active slot
+      ctx.shadowColor = '#cc44ff';
+      ctx.shadowBlur  = 12;
+      ctx.strokeRect(sx, slotY, slotW, slotH);
+      ctx.shadowBlur  = 0;
+    }
+
+    // The letter
+    ctx.fillStyle = isActive ? '#ffffff' : '#c0a0e0';
+    ctx.font = `bold 32px monospace`;
+    ctx.fillText(nameChars[i], sx + slotW / 2, slotY + slotH - 12);
+  }
+
+  // Arrow hints above/below the active slot
+  ctx.fillStyle = 'rgba(180,140,255,0.6)';
+  ctx.font = '14px monospace';
+  const activeSlotCX = startX + nameCursor * (slotW + slotGap) + slotW / 2;
+  ctx.fillText('▲', activeSlotCX, slotY - 8);
+  ctx.fillText('▼', activeSlotCX, slotY + slotH + 18);
+}
+
+// ─── HUD ──────────────────────────────────────────────────────────────────────
+
+/** Draw the live score centred at the top of the screen during gameplay. */
+function drawScore() {
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 36px monospace';
+
+  // Drop shadow (offset 2 px down-right)
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillText(score, BASE_W / 2 + 2, 54);
+
+  // White score text
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(score, BASE_W / 2, 52);
+
+  // Small decorative ghost emoji to the left
+  ctx.font = '12px monospace';
+  ctx.fillStyle = 'rgba(200,200,255,0.7)';
+  ctx.fillText('👻', BASE_W / 2 - 30, 52);
+}
+
+// ─── High Score Table ─────────────────────────────────────────────────────────
+
+/**
+ * Draw the top-5 high score table centred at `centerY`.
+ * The top entry is rendered in gold; positions 2-3 in light purple; 4-5 dimmed.
+ */
+function drawScoreTable(centerY) {
+  const scores = loadScores();
+  const cx = BASE_W / 2;
+  ctx.textAlign = 'center';
+
+  ctx.fillStyle = '#cc44ff';
+  ctx.font = 'bold 11px monospace';
+  ctx.fillText('─── HIGH SCORES ───', cx, centerY);
+
+  if (scores.length === 0) {
+    ctx.fillStyle = '#8060a0';
+    ctx.font = '10px monospace';
+    ctx.fillText('No scores yet!', cx, centerY + 22);
+    return;
+  }
+
+  const medals = ['*', '2', '3', '4', '5'];
+  for (let i = 0; i < scores.length; i++) {
+    const s = scores[i];
+    const y = centerY + 20 + i * 20;
+    // Colour by rank: gold / purple / dim
+    ctx.fillStyle = i === 0 ? '#ffd700' : (i < 3 ? '#e0c0ff' : '#8060a0');
+    ctx.font = i === 0 ? 'bold 11px monospace' : '10px monospace';
+    // Zero-pad score to 4 digits for consistent column alignment
+    ctx.fillText(`${medals[i]}  ${s.name}  ${String(s.score).padStart(4, '0')}`, cx, y);
+  }
+}
+
+// ─── Decorative Border ────────────────────────────────────────────────────────
+
+/**
+ * Draw the double-rule purple border with crescent moon ornaments in each corner.
+ * Used on the name entry and game over overlay screens.
+ */
+function drawSpookyBorder() {
+  ctx.strokeStyle = '#6020a0';
+  ctx.lineWidth   = 3;
+  ctx.strokeRect(8, 8, BASE_W - 16, BASE_H - 16);
+
+  ctx.strokeStyle = 'rgba(200,100,255,0.3)';
+  ctx.lineWidth   = 1;
+  ctx.strokeRect(12, 12, BASE_W - 24, BASE_H - 24);
+
+  const corners = [
+    [14,          14         ],
+    [BASE_W - 14, 14         ],
+    [14,          BASE_H - 14],
+    [BASE_W - 14, BASE_H - 14],
+  ];
+  ctx.fillStyle   = '#8040c0';
+  ctx.font        = '14px monospace';
+  ctx.textAlign   = 'center';
+  ctx.textBaseline = 'middle';
+  for (const [x, y] of corners) ctx.fillText('☽', x, y);
+  ctx.textBaseline = 'alphabetic';
+}
+
+// ─── Start Screen ─────────────────────────────────────────────────────────────
+
+/** Draw the title screen (rendered over the background and idle ghost). */
+function drawStartScreen() {
+  const cx = BASE_W / 2;
+  ctx.textAlign = 'center';
+
+  // Title text: drawn twice (offset shadow, then gradient fill on top)
+  ctx.font = 'bold 42px monospace';
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillText('GHOST',   cx + 2, 112);
+  ctx.fillText('FLAPPER', cx + 2, 154);
+
+  const titleGrd = ctx.createLinearGradient(cx - 100, 80, cx + 100, 160);
+  titleGrd.addColorStop(0,   '#dd88ff');
+  titleGrd.addColorStop(0.5, '#ffffff');
+  titleGrd.addColorStop(1,   '#88aaff');
+  ctx.fillStyle = titleGrd;
+  ctx.fillText('GHOST',   cx, 110);
+  ctx.fillText('FLAPPER', cx, 152);
+
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#a080cc';
+  ctx.fillText('a spooky flapping adventure', cx, 172);
+
+  drawScoreTable(280);
+
+  ctx.fillStyle = '#8060a0';
+  ctx.font = '10px monospace';
+  ctx.fillText('SPACE / UP ARROW  :  flap', cx, 400);
+
+  // Blink "press to start" on a 30-frame (≈ 0.5 s) cycle
+  if (Math.floor(frameCount / 30) % 2 === 0) {
+    ctx.fillStyle = '#cc44ff';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText('[ PRESS SPACE TO START ]', cx, 430);
+  }
+}
+
+// ─── Game Over Screen ─────────────────────────────────────────────────────────
+
+/** Draw the game-over overlay with final score, high score table, and restart prompt. */
+function drawGameOverScreen() {
+  ctx.fillStyle = 'rgba(10,0,20,0.82)';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+  drawSpookyBorder();
+
+  const cx = BASE_W / 2;
+  ctx.textAlign = 'center';
+
+  // "GAME OVER" with shadow
+  ctx.font = 'bold 38px monospace';
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillText('GAME', cx + 2, 112);
+  ctx.fillText('OVER', cx + 2, 152);
+  ctx.fillStyle = '#ff4466';
+  ctx.fillText('GAME', cx, 110);
+  ctx.fillStyle = '#ff6688';
+  ctx.fillText('OVER', cx, 150);
+
+  ctx.font = 'bold 14px monospace';
+  ctx.fillStyle = '#ffcc44';
+  ctx.fillText(`SCORE:  ${score}`, cx, 185);
+
+  drawScoreTable(220);
+
+  // Blinking restart prompt
+  if (Math.floor(frameCount / 30) % 2 === 0) {
+    ctx.fillStyle = '#cc44ff';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText('[ PRESS SPACE TO RESTART ]', cx, 430);
+  }
+}
+
+// ─── Input Handling ───────────────────────────────────────────────────────────
+
+/**
+ * Universal "action" triggered by Space, Up Arrow, or screen tap.
+ * Behaviour depends on the current game state.
+ */
+function flap() {
+  if      (gameState === STATE.PLAYING)   ghost.flap();
+  else if (gameState === STATE.START)     gameState = STATE.PLAYING;
+  else if (gameState === STATE.GAME_OVER) { initGame(); gameState = STATE.START; }
+}
+
+document.addEventListener('keydown', e => {
+  // Name entry has its own dedicated key handling; no flap in this state
+  if (gameState === STATE.NAME_ENTRY) {
+    if (e.code === 'ArrowUp') {
+      // Cycle letter forward: A→B→…→Z→A
+      const c = nameChars[nameCursor].charCodeAt(0);
+      nameChars[nameCursor] = String.fromCharCode(c < 90 ? c + 1 : 65);
+    } else if (e.code === 'ArrowDown') {
+      // Cycle letter backward: Z→Y→…→A→Z
+      const c = nameChars[nameCursor].charCodeAt(0);
+      nameChars[nameCursor] = String.fromCharCode(c > 65 ? c - 1 : 90);
+    } else if (e.code === 'ArrowLeft') {
+      nameCursor = Math.max(0, nameCursor - 1);
+    } else if (e.code === 'ArrowRight') {
+      nameCursor = Math.min(2, nameCursor + 1);
+    } else if (e.code === 'Enter') {
+      // Save the completed name and transition to the game-over screen
+      insertScore(nameChars.join(''), pendingScore);
+      nameChars  = ['A', 'A', 'A'];   // Reset for next run
+      nameCursor = 0;
+      gameState  = STATE.GAME_OVER;
+    }
+    e.preventDefault();
+    return;
+  }
+
+  if (e.code === 'Space' || e.code === 'ArrowUp') {
+    flap();
+    e.preventDefault();   // Prevent page scroll on Space/Up
+  }
+});
+
+// Touch / pointer input: tap anywhere on the canvas to flap
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  flap();
+});
+
+// ─── Main Game Loop ───────────────────────────────────────────────────────────
+// Runs at the display's refresh rate via requestAnimationFrame.
+// All drawing uses BASE_W × BASE_H coordinates after a uniform ctx.scale().
+
+let idleGhostY = BASE_H / 2;   // Y position of the bobbing ghost on the start screen
+let idleGhostT = 0;            // Accumulated time for the idle bob animation
+
+function gameLoop(timestamp) {
+  requestAnimationFrame(gameLoop);
+  frameCount++;
+
+  // Apply the canvas-to-virtual scale so all draw calls use BASE_W × BASE_H coords
+  const scale = getScale();
+  ctx.save();
+  ctx.scale(scale, scale);
+
+  // Advance the gravestone parallax offset every frame
+  bgOffset += 0.4;
+
+  // Background is drawn on every frame regardless of state
+  drawBackground();
+
+  // ── State-specific update + render ──────────────────────────────────────────
+  if (gameState === STATE.START) {
+    // Idle ghost bobs sinusoidally before the game begins
+    idleGhostT += 0.04;
+    idleGhostY = BASE_H * 0.38 + Math.sin(idleGhostT) * 15;
+    const g    = new Ghost();
+    g.y        = idleGhostY;
+    g.wobbleT  = idleGhostT * 3;   // Faster wobble clock so the tail animates visibly
+    g.draw();
+    drawStartScreen();
+
+  } else if (gameState === STATE.PLAYING) {
+    // ── Physics update ────────────────────────────────────────────────────────
+    ghost.update();
+    pipeTimer++;
+
+    // Spawn a new pipe when the timer reaches the current interval
+    if (pipeTimer >= currentInterval) {
+      spawnPipe();
+      pipeTimer = 0;
+    }
+
+    // Update pipes and check for scoring
+    for (const p of pipes) {
+      p.update();
+      // A pipe is "passed" when its right edge clears the ghost's left edge
+      if (!p.passed && p.x + p.w < GHOST_X - GHOST_W / 2) {
+        p.passed = true;
+        score++;
+        pipesCleared++;
+        // Ramp difficulty every N pipes
+        if (pipesCleared % DIFFICULTY.increaseEveryNPipes === 0) {
+          rampDifficulty();
+        }
+      }
+    }
+    // Remove pipes that have scrolled off the left edge to keep the array small
+    pipes = pipes.filter(p => !p.isOffScreen());
+
+    // Collision check — triggers death state
+    if (checkCollisions()) {
+      ghost.die();
+      flashFrames = 12;   // 12 frames ≈ 0.2 s of red flash at 60 fps
+      gameState   = STATE.DEAD;
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────────
+    for (const p of pipes) p.draw();
+    ghost.draw();
+    drawScore();
+
+  } else if (gameState === STATE.DEAD) {
+    // Keep rendering the scene while the ghost tumbles and the screen flashes
+    for (const p of pipes) p.draw();
+    ghost.update();   // Continues the tumble physics
+    ghost.draw();
+    drawScore();
+
+    if (flashFrames > 0) {
+      // Red overlay that fades out over the flash duration
+      const alpha = flashFrames / 12;
+      ctx.fillStyle = `rgba(255,50,50,${alpha * 0.45})`;
+      ctx.fillRect(0, 0, BASE_W, BASE_H);
+      flashFrames--;
+    } else {
+      // Flash finished — decide which screen comes next
+      if (qualifiesForHighScore(score)) {
+        pendingScore = score;
+        gameState    = STATE.NAME_ENTRY;
+      } else {
+        gameState = STATE.GAME_OVER;
+      }
+    }
+
+  } else if (gameState === STATE.NAME_ENTRY) {
+    drawNameEntry();
+
+  } else if (gameState === STATE.GAME_OVER) {
+    drawGameOverScreen();
+  }
+
+  ctx.restore();
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+initGame();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
